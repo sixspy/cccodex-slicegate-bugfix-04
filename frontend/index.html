@@ -33,6 +33,11 @@
   .err{color:var(--bad);min-height:18px;font-size:13px}
   .kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
   .kpi .panel{padding:12px}.kpi b{display:block;font-size:22px;margin-top:4px}
+  .policybar{border-left:4px solid var(--accent);margin-bottom:14px;font-size:13px}
+  .policybar b{color:var(--accent)}
+  .policybar span{color:var(--muted)}
+  tr.pick{cursor:pointer}
+  tr.pick:hover{background:#18233a}
 </style>
 </head>
 <body>
@@ -56,6 +61,7 @@ createApp({
     const user=ref(localStorage.getItem('slicegate_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const slices=ref([]), releases=ref([]), watermarks=ref([]);
+    const policy=ref({}), consumers=ref([]), wmEvents=ref([]), history=ref([]), histKey=ref('');
     const form=ref({slice_no:'SL-2026-11-03-east',biz_date:'2026-11-03',partition_key:'east',row_count:1000,expected_count:1000});
     const releaseSliceId=ref(1), consumer=ref('ads_order');
     const nav=['切片登记','完整度裁决','下游放行','消费水位'];
@@ -77,6 +83,12 @@ createApp({
       if(r.status===401){ logout(); return null; }
       return j;
     }
+    async function pick(consumerName,bizDate){
+      histKey.value=consumerName+' / '+bizDate;
+      const h=await loadJson('/api/watermarks/history?consumer='+encodeURIComponent(consumerName)+'&biz_date='+encodeURIComponent(bizDate));
+      if(h===null) return;
+      history.value=Array.isArray(h.items)?h.items:[];
+    }
     async function refresh(){
       if(!token.value) return;
       const s=await loadJson('/api/slices'); if(s===null) return;
@@ -85,13 +97,20 @@ createApp({
       releases.value=Array.isArray(rel.items)?rel.items:[];
       const w=await loadJson('/api/watermarks'); if(w===null) return;
       watermarks.value=Array.isArray(w.items)?w.items:[];
+      const p=await loadJson('/api/watermark-policy'); if(p===null) return;
+      policy.value=p||{};
+      const cs=await loadJson('/api/consumers'); if(cs===null) return;
+      consumers.value=Array.isArray(cs.items)?cs.items:[];
+      const ev=await loadJson('/api/watermark-events'); if(ev===null) return;
+      wmEvents.value=Array.isArray(ev.items)?ev.items:[];
       if(slices.value.length) releaseSliceId.value=slices.value[0].id;
+      if(watermarks.value.length && !histKey.value) pick(watermarks.value[0].consumer,watermarks.value[0].biz_date);
     }
     async function createSlice(){actionErr.value='';const r=await fetch('/api/slices',{method:'POST',headers:auth(),body:JSON.stringify(form.value)});const j=await r.json();if(!r.ok)actionErr.value=j.detail||'失败';await refresh();}
     async function evaluate(id){await fetch('/api/slices/'+id+'/evaluate',{method:'POST',headers:auth()});await refresh();}
     async function doRelease(){actionErr.value='';const r=await fetch('/api/slices/'+releaseSliceId.value+'/release',{method:'POST',headers:auth(),body:JSON.stringify({consumer:consumer.value})});const j=await r.json();if(!r.ok)actionErr.value=j.detail||'放行失败';await refresh();}
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,slices,releases,watermarks,form,releaseSliceId,consumer,actionErr,completeCnt,openCnt,login,logout,createSlice,evaluate,doRelease};
+    return {token,user,username,password,err,tab,nav,slices,releases,watermarks,policy,consumers,wmEvents,history,histKey,form,releaseSliceId,consumer,actionErr,completeCnt,openCnt,login,logout,createSlice,evaluate,doRelease,pick};
   },
   template:`
   <div v-if="!token" class="login">
@@ -153,10 +172,47 @@ createApp({
           <tbody><tr v-for="r in releases" :key="r.id"><td class="mono">{{r.slice_no}}</td><td>{{r.consumer}}</td><td>{{r.status}}</td><td class="mono">{{r.created_at}}</td></tr></tbody></table>
         </div>
       </div>
-      <div v-show="tab===3" class="panel">
-        <h2>消费水位</h2>
-        <table><thead><tr><th>消费方</th><th>业务日</th><th>水位</th><th>来源切片</th></tr></thead>
-        <tbody><tr v-for="w in watermarks" :key="w.id"><td>{{w.consumer}}</td><td>{{w.biz_date}}</td><td class="mono">{{w.watermark}}</td><td class="mono">{{w.source_slice}}</td></tr></tbody></table>
+      <div v-show="tab===3">
+        <div class="panel policybar">
+          <b>策略条 · 水位唯一册</b>：
+          <span>{{policy.standard||'（未登记）'}} ｜ 定于 {{policy.decided_on||'-'}}（{{policy.decided_by||'-'}}）｜ 当天不许换，偏离即拒并记「水位口径偏了」 ｜ 同消费方同业务日正式水位最多一条现行</span>
+        </div>
+        <div class="grid">
+          <div class="panel">
+            <h2>消费目录</h2>
+            <table><thead><tr><th>消费方</th><th>业务日</th><th>现行水位</th><th>来源切片</th><th>版本数</th></tr></thead>
+            <tbody><template v-for="d in consumers" :key="d.consumer">
+              <tr v-for="w in d.current" :key="d.consumer+w.biz_date" class="pick" @click="pick(d.consumer,w.biz_date)">
+                <td>{{d.consumer}}</td><td>{{w.biz_date}}</td><td class="mono">{{w.watermark}}</td><td class="mono">{{w.source_slice}}</td><td class="mono">{{w.versions}}</td>
+              </tr>
+            </template></tbody></table>
+          </div>
+          <div class="panel">
+            <h2>水位列表（默认只展示现行一条）</h2>
+            <table><thead><tr><th>消费方</th><th>业务日</th><th>水位</th><th>来源切片</th><th>值班</th></tr></thead>
+            <tbody><tr v-for="w in watermarks" :key="w.id" class="pick" @click="pick(w.consumer,w.biz_date)">
+              <td>{{w.consumer}}</td><td>{{w.biz_date}}</td><td class="mono">{{w.watermark}}</td><td class="mono">{{w.source_slice}}</td><td>{{w.actor}}</td>
+            </tr></tbody></table>
+          </div>
+        </div>
+        <div class="grid" style="margin-top:14px">
+          <div class="panel">
+            <h2>历史详情 <span style="color:var(--muted);font-size:12px">{{histKey}}</span></h2>
+            <table><thead><tr><th>状态</th><th>水位</th><th>来源切片</th><th>值班</th><th>更新时间</th></tr></thead>
+            <tbody><tr v-for="w in history" :key="'h'+w.id">
+              <td><span class="tag" :class="{bad:w.status!=='现行'}">{{w.status}}</span></td>
+              <td class="mono">{{w.watermark}}</td><td class="mono">{{w.source_slice}}</td><td>{{w.actor}}</td><td class="mono">{{w.updated_at}}</td>
+            </tr></tbody></table>
+          </div>
+          <div class="panel">
+            <h2>水位事件</h2>
+            <table><thead><tr><th>类别</th><th>详情</th><th>值班</th><th>时间</th></tr></thead>
+            <tbody><tr v-for="e in wmEvents" :key="'e'+e.id">
+              <td><span class="tag" :class="{bad:e.kind==='水位口径偏了'}">{{e.kind}}</span></td>
+              <td>{{e.detail}}</td><td>{{e.actor}}</td><td class="mono">{{e.created_at}}</td>
+            </tr></tbody></table>
+          </div>
+        </div>
       </div>
     </main>
   </div>`
